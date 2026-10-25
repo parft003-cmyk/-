@@ -1,0 +1,409 @@
+﻿import sqlite3
+import time
+import asyncio
+import logging
+
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+
+# ============ НАСТРОЙКИ ============
+API_TOKEN = '8869768348:AAHP80Icw0GBNYEL0PfnziV9NJ9YXmHmpRE'
+ADMIN_ID = 983156273
+DB_PATH = 'anonymous_chat.db'
+# ===================================
+
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ============ БАЗА ДАННЫХ ============
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            gender TEXT,
+            age INTEGER,
+            vip INTEGER DEFAULT 0,
+            likes INTEGER DEFAULT 0,
+            dislikes INTEGER DEFAULT 0,
+            reports INTEGER DEFAULT 0,
+            penalty_until REAL DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    res = None
+    if fetchone:
+        res = c.fetchone()
+    elif fetchall:
+        res = c.fetchall()
+    if commit:
+        conn.commit()
+    conn.close()
+    return res
+
+
+# ============ КЛАВИАТУРЫ ============
+def get_main_menu():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Найти 🤵")
+    kb.button(text="Рандом 🧑‍🤝‍🧑")
+    kb.button(text="Найти 👩")
+    kb.button(text="🔍 Настройки поиска")
+    kb.button(text="🚪 Комнаты")
+    kb.button(text="👑 VIP статус")
+    kb.button(text="👤 Профиль")
+    kb.adjust(3, 2, 2)
+    return kb.as_markup(resize_keyboard=True)
+
+
+def get_chat_inline_keyboard(uid, peer_id):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➡️ Следующий", callback_data=f"chat_next_{uid}_{peer_id}")
+    kb.button(text="🛑 Остановить", callback_data=f"chat_stop_{uid}_{peer_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def get_rooms_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Общение", callback_data="setroom_Общение")
+    kb.button(text="❤️ Знакомства", callback_data="setroom_Знакомства")
+    kb.button(text="🔞 Без ограничений 18+", callback_data="setroom_18+")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ============ СОСТОЯНИЯ ============
+class Registration(StatesGroup):
+    gender = State()
+    age = State()
+
+
+class ChatStates(StatesGroup):
+    choosing_room = State()
+    searching = State()
+    in_chat = State()
+
+
+# ============ ГЛОБАЛЬНОЕ СОСТОЯНИЕ ============
+active_searches = {}   
+active_chats = {}      
+
+
+# ============ ХЕЛПЕРЫ ============
+def user_ctx(user_id: int) -> FSMContext:
+    return FSMContext(
+        storage=dp.storage,
+        key=StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    )
+
+
+def get_gender(user_id: int):
+    r = db_query("SELECT gender FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    return r[0] if r else None
+
+
+async def _do_match(uid: int, target_gender, room: str):
+    my_gender = get_gender(uid)
+    peer_id = None
+
+
+    for sid, info in list(active_searches.items()):
+        if sid == uid: continue
+        if info['room'] != room: continue
+        if target_gender and info.get('gender') != target_gender: continue
+        if info.get('target_gender') and info['target_gender'] != my_gender: continue
+        
+        peer_id = sid
+        del active_searches[peer_id]
+        break
+
+
+    if peer_id is None:
+        active_searches[uid] = {
+            "target_gender": target_gender,
+            "room": room,
+            "gender": my_gender,
+        }
+        return
+
+
+    active_chats[uid] = peer_id
+    active_chats[peer_id] = uid
+
+
+    await user_ctx(uid).set_state(ChatStates.in_chat)
+    await user_ctx(peer_id).set_state(ChatStates.in_chat)
+
+
+    # Обновленный текст при нахождении (как на скрине)
+    match_text = (
+        "Нашёл кое-кого для тебя! 🍍\n\n"
+        "🔄 /next — переключить собеседника.\n"
+        "🛑 /stop — остановить диалог.\n\n"
+        "Общайтесь, но соблюдайте правила!"
+    )
+    
+    await bot.send_message(uid, match_text, reply_markup=get_chat_inline_keyboard(uid, peer_id))
+    await bot.send_message(peer_id, match_text, reply_markup=get_chat_inline_keyboard(peer_id, uid))
+
+
+async def stop_or_next_chat(uid, peer_id, is_next=False, state=None):
+    if active_chats.get(uid) == peer_id:
+        active_chats.pop(uid, None)
+    if active_chats.get(peer_id) == uid:
+        active_chats.pop(peer_id, None)
+    active_searches.pop(uid, None)
+
+
+    for user in (uid, peer_id):
+        try:
+            await user_ctx(user).set_state(ChatStates.choosing_room)
+            await bot.send_message(user, "Диалог остановлен 😫", reply_markup=get_main_menu())
+        except Exception:
+            pass
+
+
+    if is_next and state:
+        s_data = await state.get_data()
+        room = s_data.get("current_room", "Общение")
+        await state.set_state(ChatStates.searching)
+        try:
+            await bot.send_message(uid, "🔍 Ищу нового собеседника...", reply_markup=types.ReplyKeyboardRemove())
+        except Exception:
+            pass
+        await _do_match(uid, None, room)
+
+
+# ============ ХЕНДЛЕРЫ ============
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    user = db_query("SELECT user_id FROM users WHERE user_id = ?", (uid,), fetchone=True)
+
+
+    if not user:
+        kb = types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="🤵 Парень"), types.KeyboardButton(text="👩 Девушка")]],
+            resize_keyboard=True
+        )
+        await message.answer("Добро пожаловать в анонимный чат! Укажите ваш пол:", reply_markup=kb)
+        await state.set_state(Registration.gender)
+    else:
+        await message.answer("Вы вернулись в главное меню!", reply_markup=get_main_menu())
+        await state.set_state(ChatStates.choosing_room)
+
+
+@dp.message(Registration.gender, F.text.in_(["🤵 Парень", "👩 Девушка"]))
+async def process_gender(message: types.Message, state: FSMContext):
+    gender = "M" if "Парень" in message.text else "F"
+    await state.update_data(gender=gender)
+    await message.answer("Введите ваш возраст (только цифрами):", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(Registration.age)
+
+
+@dp.message(Registration.age)
+async def process_age(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        return await message.answer("Пожалуйста, введите возраст цифрами:")
+    age = int(message.text)
+    if not (10 <= age <= 100):
+        return await message.answer("Возраст должен быть от 10 до 100. Введите снова:")
+
+
+    data = await state.get_data()
+    db_query(
+        "INSERT OR REPLACE INTO users (user_id, gender, age) VALUES (?, ?, ?)",
+        (message.from_user.id, data.get('gender', 'M'), age),
+        commit=True
+    )
+    await message.answer("Регистрация успешно завершена!", reply_markup=get_main_menu())
+    await state.set_state(ChatStates.choosing_room)
+
+
+@dp.message(F.text == "👤 Профиль")
+async def show_profile(message: types.Message):
+    u = db_query("SELECT gender, age, vip, likes, dislikes FROM users WHERE user_id = ?", (message.from_user.id,), fetchone=True)
+    if u:
+        g = "Парень 🤵" if u[0] == "M" else "Девушка 👩"
+        v = "Активен 👑" if u[2] == 1 else "Нет ❌"
+        await message.answer(
+            f"👤 Ваш профиль:\n\nПол: {g}\nВозраст: {u[1]}\nVIP-статус: {v}\n👍 Лайков: {u[3]}\n👎 Дизлайков: {u[4]}"
+        )
+
+
+# --- КОМНАТЫ ---
+@dp.message(F.text == "🚪 Комнаты")
+async def show_rooms(message: types.Message):
+    await message.answer("Выберите комнату для общения:", reply_markup=get_rooms_keyboard())
+
+
+@dp.callback_query(F.data.startswith("setroom_"))
+async def set_room(callback: types.CallbackQuery, state: FSMContext):
+    room_name = callback.data.split("_")[1]
+    await state.update_data(current_room=room_name)
+    await callback.message.edit_text(f"✅ Вы выбрали комнату: {room_name}\nТеперь нажмите «Рандом» или «Найти», чтобы начать поиск.")
+    await callback.answer()
+
+
+# --- НАСТРОЙКИ ПОИСКА (VIP ONLY) ---
+@dp.message(F.text == "🔍 Настройки поиска")
+async def search_settings(message: types.Message):
+    await message.answer(
+        "🔒 Настройки поиска доступны только пользователям с 👑 VIP статусом.\n\n"
+        "С VIP вы сможете искать собеседников по возрасту, стране и другим параметрам."
+    )
+
+
+# --- VIP СТАТУС ---
+@dp.message(F.text == "👑 VIP статус")
+async def vip_status(message: types.Message):
+    text = (
+        "Преимущества VIP-подписки 👑\n\n"
+        "📎 Никакой рекламы\n"
+        "📎 Первое место в поиске 🔥\n"
+        "📎 Отсутствие ограничений на отправку фото/видео/стикеров и ссылок\n"
+        "📎 Подробная информация о собеседнике (возраст, страна, расстояние 📍)\n"
+        "📎 Поиск по полу без ограничений 👫\n"
+        "📎 Поиск по возрасту и стране\n"
+        "📎 Другие участники чата увидят твой статус 👑 вначале диалога\n"
+        "📎 Да блин, это просто круто, выделяйся из серой массы"
+    )
+    await message.answer(text)
+
+
+# Команда для выдачи VIP (только для админа, чтобы протестировать)
+@dp.message(Command("setvip"))
+async def admin_set_vip(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        db_query("UPDATE users SET vip = 1 WHERE user_id = ?", (ADMIN_ID,), commit=True)
+        await message.answer("✅ Вам выдан VIP статус для теста!")
+    else:
+        await message.answer("Эта команда только для администратора.")
+
+
+# --- ПОИСК ---
+@dp.message(F.text.in_(["Найти 🤵", "Рандом 🧑‍🤝‍🧑", "Найти 👩"]))
+async def start_search(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    u = db_query("SELECT vip, penalty_until FROM users WHERE user_id = ?", (uid,), fetchone=True)
+
+
+    if u and u[1] > time.time():
+        remains = int(u[1] - time.time())
+        return await message.answer(f"⚠️ Поиск заблокирован из-за жалоб. Подождите {remains} сек.")
+
+
+    target_gender = None
+    if "🤵" in message.text: target_gender = "M"
+    elif "👩" in message.text: target_gender = "F"
+
+
+    # Проверка на VIP для поиска по полу
+    if target_gender and (not u or u[0] == 0):
+        return await message.answer(
+            "🔒 Поиск по полу доступен только пользователям с 👑 VIP статусом!\n\n"
+            "Купите VIP или используйте кнопку «Рандом 🧑‍🤝‍🧑»."
+        )
+
+
+    s_data = await state.get_data()
+    room = s_data.get("current_room", "Общение")
+
+
+    await message.answer("🔍 Ищу собеседника...", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(ChatStates.searching)
+    await _do_match(uid, target_gender, room)
+
+
+# Обработка команд /next и /stop текстом
+@dp.message(Command("stop"))
+async def cmd_stop(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    peer_id = active_chats.get(uid)
+    if peer_id:
+        await stop_or_next_chat(uid, peer_id, is_next=False, state=state)
+
+
+@dp.message(Command("next"))
+async def cmd_next(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    peer_id = active_chats.get(uid)
+    if peer_id:
+        await stop_or_next_chat(uid, peer_id, is_next=True, state=state)
+    else:
+        await start_search(message, state)
+
+
+@dp.callback_query(F.data.startswith("chat_"))
+async def handle_chat_buttons(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        _, action, uid_s, peer_s = callback.data.split("_")
+        uid, peer_id = int(uid_s), int(peer_s)
+    except Exception:
+        return await callback.answer()
+
+
+    if callback.from_user.id != uid:
+        return await callback.answer("Это не ваша кнопка!", show_alert=True)
+
+
+    if action in ("stop", "next"):
+        await callback.answer()
+        await stop_or_next_chat(uid, peer_id, is_next=(action=="next"), state=state)
+
+
+@dp.message(ChatStates.in_chat)
+async def relay_message(message: types.Message):
+    peer_id = active_chats.get(message.from_user.id)
+    if not peer_id:
+        return
+    try:
+        if message.text:
+            await bot.send_message(peer_id, message.text)
+        elif message.photo:
+            await bot.send_photo(peer_id, message.photo[-1].file_id, caption=message.caption)
+        elif message.voice:
+            await bot.send_voice(peer_id, message.voice.file_id)
+        elif message.video_note:
+            await bot.send_video_note(peer_id, message.video_note.file_id)
+        elif message.sticker:
+            await bot.send_sticker(peer_id, message.sticker.file_id)
+        elif message.video:
+            await bot.send_video(peer_id, message.video.file_id, caption=message.caption)
+        elif message.document:
+            await bot.send_document(peer_id, message.document.file_id, caption=message.caption)
+        elif message.animation:
+            await bot.send_animation(peer_id, message.animation.file_id, caption=message.caption)
+        elif message.audio:
+            await bot.send_audio(peer_id, message.audio.file_id)
+    except Exception as e:
+        logging.warning(f"Relay error: {e}")
+
+
+# ============ ЗАПУСК ============
+if __name__ == '__main__':
+    print("Бот запущен...")
+    asyncio.run(dp.start_polling(bot))
